@@ -1,0 +1,48 @@
+{
+  "name": "PNYX-Contract-Midnight",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "compact": "npm run compact:tf && npm run compact:vpm",
+    "compact:tf": "compact compile contracts/TournamentFinalizer.compact contracts/managed/TournamentFinalizer",
+    "compact:vpm": "compact compile contracts/VotePointManager.compact contracts/managed/VotePointManager",
+    "compact:fast": "compact compile --skip-zk contracts/TournamentFinalizer.compact contracts/managed/TournamentFinalizer && compact compile --skip-zk contracts/VotePointManager.compact contracts/managed/VotePointManager",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:compile": "npm run compact:fast && vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "deploy": "tsx scripts/deploy.ts",
+    "deploy:vote": "tsx scripts/deployVotePointManager.ts",
+    "proof-server": "docker run --rm -p 6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server -v"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.2",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-js": "^2.5.1",
+    "@midnight-ntwrk/compact-runtime": "^0.16.0",
+    "@midnight-ntwrk/ledger-v8": "^8.1.0",
+    "@midnight-ntwrk/midnight-js": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-level-private-state-provider": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-network-id": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "^4.1.1",
+    "@midnight-ntwrk/onchain-runtime-v3": "^3.0.0",
+    "@midnight-ntwrk/wallet-sdk-abstractions": "^2.1.0",
+    "@midnight-ntwrk/wallet-sdk-address-format": "^3.1.2",
+    "@midnight-ntwrk/wallet-sdk-dust-wallet": "^4.1.0",
+    "@midnight-ntwrk/wallet-sdk-facade": "^4.0.1",
+    "@midnight-ntwrk/wallet-sdk-hd": "^3.0.2",
+    "@midnight-ntwrk/wallet-sdk-shielded": "^3.0.1",
+    "@midnight-ntwrk/wallet-sdk-unshielded-wallet": "^3.1.0",
+    "dotenv": "^17.4.2",
+    "rxjs": "^7.8.2",
+    "ws": "^8.21.3"
+  }
+}

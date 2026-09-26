@@ -1,0 +1,10 @@
+node_modules/
+contracts/managed/
+reports/
+.env
+.omc/
+scripts/output/escrow.json
+scripts/output/wallet-state-*.json
+midnight-level-db/
+.DS_Store
+scripts/output/*.enc

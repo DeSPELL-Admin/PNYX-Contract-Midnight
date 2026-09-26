@@ -1,0 +1,313 @@
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+// =========================================================================================
+// TournamentFinalizer (Midnight / Compact)
+//
+// Port of PNYX-Contract/contracts/TournamentFinalizer.sol. The Solidity version verified a
+// backend-issued EIP-712 signature and emitted the user's whole bracket in a public event.
+// Here the backend ("finalizeSigner") instead inserts an *eligibility leaf* on-chain, and the
+// user finalizes by proving — in zero knowledge — that they hold the secret behind one of
+// those leaves. The vote itself is stored only as a commitment; identity / segment never
+// reach the ledger.
+// =========================================================================================
+
+// =========================
+// TYPES
+// =========================
+/// @notice The private payload committed per vote. Every vote is sellable: the client escrows the
+///         same tuple (+ salt) with PNYX so `sellRows` can later open it against `voteCommits`.
+export struct VoteRow {
+    tournamentId: Uint<16>;
+    itemId: Uint<16>;      // champion — revealed only to a buyer
+    bracketHash: Bytes<32>; // persistentHash(bracket) — the FULL pick sequence, sealed until sale
+    segment: Bytes<32>;    // hash(ageBand, gender) — demographic part of the sold row
+}
+
+/// @notice A row the operator holds in escrow, presented to a sell circuit as a witness.
+export struct EscrowRow {
+    present: Boolean;                     // false = padding slot
+    row: VoteRow;
+    salt: Bytes<32>;
+    path: MerkleTreePath<16, Bytes<32>>;  // membership of voteCommitment(row, salt) in voteCommits
+}
+
+/// @notice On-chain record of one data sale. Analogue of an event, but queryable.
+export struct License {
+    buyerPk: Bytes<32>;
+    tournamentId: Uint<16>;
+    querySpecHash: Bytes<32>;    // sha256(canonical QuerySpec) — buyer re-checks what they bought
+    datasetHash: Bytes<32>;      // hash of the buyer-encrypted file
+    commitDigest: Bytes<32>;     // H(commitments delivered) — buyer matches rows to chain
+    rowCount: Uint<32>;          // rows delivered in this sale
+    sampleAtSale: Uint<32>;      // on-chain sampleCount at sale time — rowCount == sampleAtSale ⇒ full dataset
+}
+
+// =========================
+// STATE
+// =========================
+/// @notice Deployer coin public key. Analogue of OpenZeppelin `Ownable.owner()`.
+export ledger owner: Bytes<32>;
+/// @notice Backend operator authorized to grant eligibility. Analogue of `finalizeSigner`.
+export ledger finalizeSigner: Bytes<32>;
+/// @notice Domain separator mixed into every eligibility leaf. Analogue of the EIP-712 typehash.
+export ledger domainTag: Bytes<32>;
+
+/// @notice Eligibility leaves inserted by the signer. Historic so a user can prove against a
+///         root that was current when their grant was issued.
+export ledger eligibility: HistoricMerkleTree<16, Bytes<32>>;
+/// @notice Consumed (userSecret, tournamentId) nullifiers. Analogue of `nonces`.
+export ledger nullifiers: Set<Bytes<32>>;
+/// @notice Opaque vote commitments — the only per-vote artifact on the ledger.
+export ledger voteCommits: HistoricMerkleTree<16, Bytes<32>>;
+/// @notice Votes per tournament (the data-market sample size).
+export ledger sampleCount: Map<Uint<16>, Counter>;
+/// @notice 매치별 승수 — key = tid<<32 | lowId<<16 | highId (low < high).
+///         회로 안에서 브라켓을 접어 올리므로 조작 불가. 이전 EVM 체인의 오프체인 extractMatchStats 대응.
+/// @notice Counters standing in for the Solidity events (no events in Compact).
+export ledger grantedCount: Counter;
+export ledger finalizedCount: Counter;
+
+// ---- data market ----
+/// @notice Buyers registered by the operator (delivery public keys).
+export ledger buyers: Set<Bytes<32>>;
+/// @notice licenseId → License. Permanent audit trail of every sale.
+export ledger licenses: Map<Bytes<32>, License>;
+export ledger licenseCount: Counter;
+/// @notice Minimum segment sample size a segment sale may disclose.
+
+// =========================
+// WITNESSES (private, client-side)
+// =========================
+witness userSecret(): Bytes<32>;
+witness voteSalt(): Bytes<32>;
+witness eligibilityPath(leaf: Bytes<32>): MerkleTreePath<16, Bytes<32>>;
+/// @notice Operator-side: escrowed rows for `tournamentId`, padded to ESCROW_BATCH.
+witness escrowRows(tournamentId: Uint<16>): Vector<8, EscrowRow>;
+
+// =========================
+// CONSTRUCTOR
+// =========================
+constructor(_finalizeSigner: Bytes<32>, _domainTag: Bytes<32>) {
+    assert(_finalizeSigner != default<Bytes<32>>, "ZeroAddress");
+    owner = ownPublicKey().bytes;
+    finalizeSigner = disclose(_finalizeSigner);
+    domainTag = disclose(_domainTag);
+}
+
+// =========================
+// ACCESS CONTROL
+// =========================
+circuit onlyOwner(): [] {
+    assert(ownPublicKey().bytes == owner, "NotOwner");
+}
+
+circuit onlySigner(): [] {
+    assert(ownPublicKey().bytes == finalizeSigner, "NotSigner");
+}
+
+// =========================
+// PURE HELPERS (shared with PNYX-BE via the generated `pureCircuits`)
+// =========================
+/// @notice Public identity derived from the user's secret. Never equals the wallet key.
+export pure circuit userPublicKey(secret: Bytes<32>): Bytes<32> {
+    return persistentHash<Vector<2, Bytes<32>>>([pad(32, "pnyx:user:pk"), secret]);
+}
+
+/// @notice Eligibility leaf = H(domainTag, userPk, tournamentId, point, deadline, bracketHash).
+///         bracketHash 를 바인딩하지 않으면 grant 는 정상 브라켓으로 받고 제출은 조작 브라켓으로 하는
+///         온체인 매치 통계 오염이 가능하다 (이전 EVM 체인에선 EIP-712 서명이 tournamentData 를 덮던 부분).
+export pure circuit eligibilityLeaf(
+    tag: Bytes<32>,
+    userPk: Bytes<32>,
+    tournamentId: Uint<16>,
+    point: Uint<64>,
+    deadline: Uint<64>,
+    bHash: Bytes<32>
+): Bytes<32> {
+    return persistentHash<Vector<6, Bytes<32>>>([
+        tag,
+        userPk,
+        tournamentId as Field as Bytes<32>,
+        point as Field as Bytes<32>,
+        deadline as Field as Bytes<32>,
+        bHash
+    ]);
+}
+
+/// @notice One vote per (user, tournament).
+export pure circuit voteNullifier(secret: Bytes<32>, tournamentId: Uint<16>): Bytes<32> {
+    return persistentHash<Vector<3, Bytes<32>>>([pad(32, "pnyx:nullifier"), secret, tournamentId as Field as Bytes<32>]);
+}
+
+/// @notice Vote commitment. Opened later (by PNYX, with the escrowed row + salt) in the data market.
+export pure circuit voteCommitment(row: VoteRow, salt: Bytes<32>): Bytes<32> {
+    return persistentCommit<VoteRow>(row, salt);
+}
+
+export pure circuit licenseId(buyerPk: Bytes<32>, tournamentId: Uint<16>, specHash: Bytes<32>): Bytes<32> {
+    return persistentHash<Vector<3, Bytes<32>>>([buyerPk, tournamentId as Field as Bytes<32>, specHash]);
+}
+
+
+// =========================
+// WRITE FUNCTION
+// =========================
+/// @notice Backend grants a user the right to finalize `tournamentId` for `point` until `deadline`.
+export circuit grantEligibility(leaf: Bytes<32>): [] {
+    onlySigner();
+    eligibility.insert(disclose(leaf));
+    grantedCount.increment(1);
+}
+
+/// @notice 사이즈 변형(16/32/64)이 공유하는 finalize 본체 — 자격 증명·널리파이어·커밋·표본 카운트.
+///         매치 접기만 사이즈별 회로가 언롤한다.
+circuit finalizeCommon(
+    _tournamentId: Uint<16>,
+    _point: Uint<64>,
+    _deadline: Uint<64>,
+    _champion: Uint<16>,
+    _bHash: Bytes<32>,
+    _segment: Bytes<32>
+): [] {
+    assert(!kernel.blockTimeGreaterThan(disclose(_deadline)), "ExpiredSignature");
+
+    // eligibility: leaf 가 브라켓 해시까지 바인딩하므로 grant 와 다른 브라켓 제출은 InvalidSigner
+    const secret = userSecret();
+    const leaf = eligibilityLeaf(domainTag, userPublicKey(secret), _tournamentId, _point, _deadline, _bHash);
+    const path = eligibilityPath(leaf);
+    assert(path.leaf == leaf, "InvalidSigner");
+    assert(eligibility.checkRoot(disclose(merkleTreePathRoot<16, Bytes<32>>(path))), "InvalidSigner");
+
+    // replay protection
+    const nul = voteNullifier(secret, _tournamentId);
+    assert(!nullifiers.member(disclose(nul)), "AlreadyFinalized");
+    nullifiers.insert(disclose(nul));
+
+    // opaque commitment — the champion, the full bracket (as bracketHash) and the segment are
+    // ALL sealed inside; nothing about the user's picks is disclosed on-chain (B-design)
+    const row = VoteRow { tournamentId: _tournamentId, itemId: _champion, bracketHash: _bHash, segment: _segment };
+    voteCommits.insert(disclose(voteCommitment(row, voteSalt())));
+
+    // public aggregate — participation count ONLY (picks stay sealed)
+    if (!sampleCount.member(disclose(_tournamentId))) sampleCount.insertDefault(disclose(_tournamentId));
+    sampleCount.lookup(disclose(_tournamentId)).increment(1);
+    finalizedCount.increment(1);
+}
+
+/// @notice 16강 브라켓 해시.
+export pure circuit bracketHash16(bracket: Vector<16, Uint<16>>): Bytes<32> {
+    return persistentHash<Vector<16, Uint<16>>>(bracket);
+}
+
+/// @notice finalize — 선택 전체는 bracketHash 로 커밋 안에 봉인된다 (B-design).
+export circuit finalizeTournament16(
+    _tournamentId: Uint<16>,
+    _point: Uint<64>,
+    _deadline: Uint<64>,
+    _bracket: Vector<16, Uint<16>>,
+    _segment: Bytes<32>
+): [] {
+    finalizeCommon(_tournamentId, _point, _deadline, _bracket[0], bracketHash16(_bracket), _segment);
+}
+
+/// @notice 32강 브라켓 해시.
+export pure circuit bracketHash32(bracket: Vector<32, Uint<16>>): Bytes<32> {
+    return persistentHash<Vector<32, Uint<16>>>(bracket);
+}
+
+/// @notice finalize — 선택 전체는 bracketHash 로 커밋 안에 봉인된다 (B-design).
+export circuit finalizeTournament32(
+    _tournamentId: Uint<16>,
+    _point: Uint<64>,
+    _deadline: Uint<64>,
+    _bracket: Vector<32, Uint<16>>,
+    _segment: Bytes<32>
+): [] {
+    finalizeCommon(_tournamentId, _point, _deadline, _bracket[0], bracketHash32(_bracket), _segment);
+}
+
+/// @notice 64강 브라켓 해시.
+export pure circuit bracketHash64(bracket: Vector<64, Uint<16>>): Bytes<32> {
+    return persistentHash<Vector<64, Uint<16>>>(bracket);
+}
+
+/// @notice finalize — 선택 전체는 bracketHash 로 커밋 안에 봉인된다 (B-design).
+export circuit finalizeTournament64(
+    _tournamentId: Uint<16>,
+    _point: Uint<64>,
+    _deadline: Uint<64>,
+    _bracket: Vector<64, Uint<16>>,
+    _segment: Bytes<32>
+): [] {
+    finalizeCommon(_tournamentId, _point, _deadline, _bracket[0], bracketHash64(_bracket), _segment);
+}
+// =========================
+// DATA MARKET
+// =========================
+export circuit registerBuyer(buyerPk: Bytes<32>): [] {
+    onlySigner();
+    assert(buyerPk != default<Bytes<32>>, "ZeroAddress");
+    buyers.insert(disclose(buyerPk));
+}
+
+circuit requireBuyer(buyerPk: Bytes<32>): [] {
+    onlySigner();
+    assert(buyers.member(disclose(buyerPk)), "BuyerNotRegistered");
+}
+
+circuit requireFreshLicense(id: Bytes<32>): [] {
+    assert(!licenses.member(disclose(id)), "LicenseExists");
+}
+
+/// @notice Every present row must (a) belong to the tournament and (b) open a commitment that is
+///         in `voteCommits`.
+circuit checkRow(r: EscrowRow, tournamentId: Uint<16>): [] {
+    assert(!r.present || r.row.tournamentId == tournamentId, "WrongTournament");
+    assert(!r.present || r.path.leaf == voteCommitment(r.row, r.salt), "RowNotOnChain");
+    // The ledger read must not be conditioned on the (private) `present` flag — evaluate it
+    // unconditionally (the root is public anyway) and gate only the assertion.
+    const onChain = voteCommits.checkRoot(disclose(merkleTreePathRoot<16, Bytes<32>>(r.path)));
+    assert(!r.present || onChain, "RowNotOnChain");
+}
+
+/// @notice The single data product: proves every delivered row opens an on-chain vote commitment
+///         and pins the dataset hash. Also records the tournament's total sample at sale time so
+///         the buyer can verify on-chain that they received the FULL dataset as of this moment
+///         (rowCount == sampleAtSale). Encryption to `buyerPk` happens off-chain.
+export circuit sellRows(buyerPk: Bytes<32>, tournamentId: Uint<16>, specHash: Bytes<32>, datasetHash: Bytes<32>): [] {
+    requireBuyer(buyerPk);
+    const id = licenseId(buyerPk, tournamentId, specHash);
+    requireFreshLicense(id);
+
+    const rows = escrowRows(tournamentId);
+    for (const r of rows) checkRow(r, tournamentId);
+
+    const n = fold((acc: Uint<32>, r: EscrowRow): Uint<32> => r.present ? (acc + 1) as Uint<32> : acc, 0 as Uint<32>, rows);
+    assert(n > 0, "EmptyDataset");
+    const digest = persistentHash<Vector<8, Bytes<32>>>(map((r: EscrowRow): Bytes<32> => r.path.leaf, rows));
+    const sample = sampleCount.member(disclose(tournamentId)) ? sampleCount.lookup(disclose(tournamentId)).read() : 0;
+
+    licenses.insert(disclose(id), disclose(License {
+        buyerPk: buyerPk, tournamentId: tournamentId, querySpecHash: specHash,
+        datasetHash: datasetHash, commitDigest: digest, rowCount: n, sampleAtSale: sample as Uint<32>
+    }));
+    licenseCount.increment(1);
+}
+
+// =========================
+// SET FUNCTION
+// =========================
+export circuit setFinalizeSigner(_finalizeSigner: Bytes<32>): [] {
+    onlyOwner();
+    assert(_finalizeSigner != default<Bytes<32>>, "ZeroAddress");
+    assert(_finalizeSigner != finalizeSigner, "ValueUnchanged");
+    finalizeSigner = disclose(_finalizeSigner);
+}
+
+export circuit setDomainTag(_domainTag: Bytes<32>): [] {
+    onlyOwner();
+    assert(_domainTag != domainTag, "ValueUnchanged");
+    domainTag = disclose(_domainTag);
+}

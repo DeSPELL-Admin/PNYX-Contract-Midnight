@@ -1,0 +1,163 @@
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+// =========================================================================================
+// VotePointManager (Midnight / Compact)
+//
+// Port of PNYX-Contract/contracts/VotePointManager.sol. The backend ("voteSigner") authorizes a
+// point movement (bet / cancel / reward) by inserting a *grant leaf* bound to the user + intent;
+// the user settles by proving knowledge of the secret behind that leaf. Each grant carries a
+// backend-chosen nonce and can be consumed exactly once.
+// =========================================================================================
+
+// =========================
+// TYPES
+// =========================
+/// @notice Public settlement record. Analogue of the `Settled` event (same fields, same visibility).
+export struct Settlement {
+    user: Bytes<32>;        // userPublicKey(secret), not the wallet key
+    tournamentId: Uint<64>;
+    itemId: Uint<64>;
+    amount: Uint<128>;
+    option: Bytes<32>;      // optionTag("bet" | "cancel" | "reward")
+}
+
+// =========================
+// STATE
+// =========================
+export ledger owner: Bytes<32>;
+export ledger voteSigner: Bytes<32>;
+export ledger domainTag: Bytes<32>;
+
+export ledger grants: HistoricMerkleTree<16, Bytes<32>>;
+export ledger nullifiers: Set<Bytes<32>>;
+export ledger settlements: Map<Bytes<32>, Settlement>;
+export ledger grantedCount: Counter;
+export ledger settledCount: Counter;
+
+// =========================
+// WITNESSES
+// =========================
+witness userSecret(): Bytes<32>;
+witness grantPath(leaf: Bytes<32>): MerkleTreePath<16, Bytes<32>>;
+
+// =========================
+// CONSTRUCTOR
+// =========================
+constructor(_voteSigner: Bytes<32>, _domainTag: Bytes<32>) {
+    assert(_voteSigner != default<Bytes<32>>, "ZeroAddress");
+    owner = ownPublicKey().bytes;
+    voteSigner = disclose(_voteSigner);
+    domainTag = disclose(_domainTag);
+}
+
+// =========================
+// ACCESS CONTROL
+// =========================
+circuit onlyOwner(): [] {
+    assert(ownPublicKey().bytes == owner, "NotOwner");
+}
+
+circuit onlySigner(): [] {
+    assert(ownPublicKey().bytes == voteSigner, "NotSigner");
+}
+
+// =========================
+// PURE HELPERS
+// =========================
+export pure circuit userPublicKey(secret: Bytes<32>): Bytes<32> {
+    return persistentHash<Vector<2, Bytes<32>>>([pad(32, "pnyx:user:pk"), secret]);
+}
+
+/// @notice Grant leaf = H(tag, userPk, tournamentId, itemId, amount, option, deadline, nonce).
+///         Mirrors the EIP-712 `Vote` struct hash field-for-field.
+export pure circuit settleLeaf(
+    tag: Bytes<32>,
+    userPk: Bytes<32>,
+    tournamentId: Uint<64>,
+    itemId: Uint<64>,
+    amount: Uint<128>,
+    option: Bytes<32>,
+    deadline: Uint<64>,
+    nonce: Uint<64>
+): Bytes<32> {
+    return persistentHash<Vector<8, Bytes<32>>>([
+        tag,
+        userPk,
+        tournamentId as Field as Bytes<32>,
+        itemId as Field as Bytes<32>,
+        amount as Field as Bytes<32>,
+        option,
+        deadline as Field as Bytes<32>,
+        nonce as Field as Bytes<32>
+    ]);
+}
+
+/// @notice One consumption per grant.
+export pure circuit settleNullifier(secret: Bytes<32>, leaf: Bytes<32>): Bytes<32> {
+    return persistentHash<Vector<3, Bytes<32>>>([pad(32, "pnyx:settle:nul"), secret, leaf]);
+}
+
+// =========================
+// WRITE FUNCTION
+// =========================
+export circuit grantSettle(leaf: Bytes<32>): [] {
+    onlySigner();
+    grants.insert(disclose(leaf));
+    grantedCount.increment(1);
+}
+
+/**
+ * @notice Settles a point movement after proving a matching grant exists.
+ * @dev Public record mirrors the Solidity `Settled` event: user (derived key), ids, amount, option.
+ */
+export circuit settle(
+    _tournamentId: Uint<64>,
+    _itemId: Uint<64>,
+    _amount: Uint<128>,
+    _option: Bytes<32>,
+    _deadline: Uint<64>,
+    _nonce: Uint<64>
+): [] {
+    assert(!kernel.blockTimeGreaterThan(disclose(_deadline)), "ExpiredSignature");
+
+    const secret = userSecret();
+    const userPk = userPublicKey(secret);
+    const leaf = settleLeaf(domainTag, userPk, _tournamentId, _itemId, _amount, _option, _deadline, _nonce);
+    const path = grantPath(leaf);
+    assert(path.leaf == leaf, "InvalidSigner");
+    assert(grants.checkRoot(disclose(merkleTreePathRoot<16, Bytes<32>>(path))), "InvalidSigner");
+
+    const nul = settleNullifier(secret, leaf);
+    assert(!nullifiers.member(disclose(nul)), "NonceConsumed");
+    nullifiers.insert(disclose(nul));
+
+    settlements.insert(
+        disclose(nul),
+        disclose(Settlement {
+            user: userPk,
+            tournamentId: _tournamentId,
+            itemId: _itemId,
+            amount: _amount,
+            option: _option
+        })
+    );
+    settledCount.increment(1);
+}
+
+// =========================
+// SET FUNCTION
+// =========================
+export circuit setVoteSigner(_voteSigner: Bytes<32>): [] {
+    onlyOwner();
+    assert(_voteSigner != default<Bytes<32>>, "ZeroAddress");
+    assert(_voteSigner != voteSigner, "ValueUnchanged");
+    voteSigner = disclose(_voteSigner);
+}
+
+export circuit setDomainTag(_domainTag: Bytes<32>): [] {
+    onlyOwner();
+    assert(_domainTag != domainTag, "ValueUnchanged");
+    domainTag = disclose(_domainTag);
+}

@@ -1,0 +1,14 @@
+{
+  "network": "preprod",
+  "deployedAt": "2026-09-01T08:52:09.380Z",
+  "contracts": {
+    "tournamentFinalizer": "1fe82f185fe7187ef335365c1ccf9fa7bc47b7a03fab84372d70c73262d00249",
+    "votePointManager": "350a14d9c9c07951d749607268036577f803f4f659e112bde0bf41f644eee3d8"
+  },
+  "finalizeSigner": "c0844c436b9e059744cc30895e76fc2b6a7b14e1edea0f1cff9c52796e884ed9",
+  "domainTags": {
+    "tournamentFinalizer": "pnyx:finalize:v1",
+    "votePointManager": "pnyx:vote:v1"
+  },
+  "voteSigner": "c0844c436b9e059744cc30895e76fc2b6a7b14e1edea0f1cff9c52796e884ed9"
+}
