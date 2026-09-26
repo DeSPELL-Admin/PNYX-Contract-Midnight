@@ -33,7 +33,7 @@ The Solidity version of PNYX (EVM) was ported to Compact as follows:
 | `@midnight-ntwrk/onchain-runtime-v3` | **3.0.0 (pinned)** | `midnight-js-protocol` pins 3.0.0; letting npm pull 3.1.0 at top level gives two WASM instances → `expected instance of StateValue` on every call tx |
 | `@midnight-ntwrk/wallet-sdk-*`    | stable  | facade 4.0.1, shielded 3.0.1, unshielded 3.1.0, dust 4.1.0, hd 3.0.2, address-format 3.1.2 |
 | proof server (docker)             | 8.1.0   | `npm run proof-server`                                        |
-| Node                              | **22.x** | Node 25 OOMs (4 GB heap) during preprod wallet sync; run scripts with `nvm use 22` |
+| Node                              | **22.13+ or 24 LTS** | Node 25 OOMs (4 GB heap) during preprod wallet sync. npm 10.9.0 (Node ≤ 22.11) skips rolldown's optional native binding on `npm ci` and vitest fails with `Cannot find native binding` — use Node 22.13+/24 or `npm install -g npm@latest` |
 
 Newer `compact` (0.34) compiles fine and the test-suite also passes on runtime 0.19, but no
 published `midnight-js` + wallet-SDK pair exists for it yet — so deployment scripts would not build.
